@@ -18,16 +18,32 @@ MESES_ES = {
     9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
 }
 
-COLUMN_MAP = {
-    "categoria": ["categoria"],
-    "concepto": ["concepto"],
-    "valor": ["vlr flujo", "valor dc", "valor d/c", "vlr", "valor", "valor de la compra"],
-    "fecha": ["fecha", "date", "fecha movimiento", "fecha valor", "fecha transaccion"],
+KEYWORDS_CATEGORIA = [
+    "categoria", "tipo", "tipo de movimiento", "tipo movimiento",
+    "tipo transaccion", "clase", "naturaleza",
+]
+KEYWORDS_CONCEPTO = [
+    "concepto", "descripcion", "description", "detalle",
+    "referencia", "movimiento", "glosa", "observacion",
+]
+KEYWORDS_VALOR = [
+    "vlr flujo", "valor dc", "valor d/c", "vlr", "valor",
+    "valor de la compra", "importe", "monto", "debito credito",
+]
+KEYWORDS_FECHA = [
+    "fecha", "date", "fecha movimiento", "fecha valor",
+    "fecha transaccion", "fecha operacion", "fec",
+]
+
+VALORES_INGRESO = {"ingreso", "ingresos", "credito", "creditos", "entrada", "entradas"}
+VALORES_EGRESO = {
+    "egreso", "egresos", "gasto", "gastos", "salida", "salidas",
+    "debito", "debitos", "pago", "pagos",
 }
 
 
 def normalize(text):
-    text = str(text).lower()
+    text = str(text).lower().strip()
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]", "", text)
 
@@ -100,13 +116,13 @@ def standardize_df(df, filename):
     cols = df.columns.tolist()
     n = len(df)
 
-    categoria_col = find_column(cols, COLUMN_MAP["categoria"])
-    concepto_col = find_column(cols, COLUMN_MAP["concepto"])
-    valor_col = find_column(cols, COLUMN_MAP["valor"])
-    fecha_col = find_column(cols, COLUMN_MAP["fecha"])
+    categoria_col = find_column(cols, KEYWORDS_CATEGORIA)
+    concepto_col = find_column(cols, KEYWORDS_CONCEPTO)
+    valor_col = find_column(cols, KEYWORDS_VALOR)
+    fecha_col = find_column(cols, KEYWORDS_FECHA)
 
-    categoria = df[categoria_col] if categoria_col else pd.Series(["Sin categoria"] * n)
-    concepto = df[concepto_col] if concepto_col else pd.Series(["Sin concepto"] * n)
+    categoria = df[categoria_col].fillna("Sin categoria") if categoria_col else pd.Series(["Sin categoria"] * n)
+    concepto = df[concepto_col].fillna("Sin concepto") if concepto_col else pd.Series(["Sin concepto"] * n)
     total = clean_money(df[valor_col]) if valor_col else pd.Series([0.0] * n)
 
     if fecha_col:
@@ -120,12 +136,25 @@ def standardize_df(df, filename):
     banco = str(filename).replace(".xlsx", "").replace(".xls", "")
 
     return pd.DataFrame({
-        "Categoria": categoria.fillna("Sin categoria").values,
-        "Concepto": concepto.fillna("Sin concepto").values,
+        "Categoria": categoria.astype(str).values,
+        "Concepto": concepto.astype(str).values,
         "Banco": banco,
         "Fecha": fecha.values,
         "Valor": total.values,
-    })
+    }), {
+        "categoria_col": categoria_col,
+        "concepto_col": concepto_col,
+        "valor_col": valor_col,
+        "fecha_col": fecha_col,
+    }
+
+
+def es_ingreso(cat_str):
+    return normalize(cat_str) in VALORES_INGRESO
+
+
+def es_egreso(cat_str):
+    return normalize(cat_str) in VALORES_EGRESO
 
 
 def build_excel_flujo(final_pivot, existing_mes_cols):
@@ -136,6 +165,8 @@ def build_excel_flujo(final_pivot, existing_mes_cols):
     header_font = Font(bold=True, color="FFFFFF", size=11)
     total_fill = PatternFill("solid", fgColor="BDD7EE")
     total_font = Font(bold=True, size=12)
+    ingreso_fill = PatternFill("solid", fgColor="E2EFDA")
+    egreso_fill = PatternFill("solid", fgColor="FCE4D6")
     alt_fill = PatternFill("solid", fgColor="F2F7FB")
     border = Border(
         left=Side(style="thin"),
@@ -156,19 +187,29 @@ def build_excel_flujo(final_pivot, existing_mes_cols):
 
     row_idx = 2
     for _, row in final_pivot.iterrows():
-        categoria = str(row.get("Categoria", "")).strip().upper()
-        is_total_general = categoria in (
-            "FLUJO NETO", "SALDO ACUMULADO", "TOTAL INGRESOS", "TOTAL EGRESOS"
-        )
+        cat_upper = str(row.get("Categoria", "")).strip().upper()
+        is_flujo_neto = cat_upper in ("FLUJO NETO", "SALDO ACUMULADO")
+        is_ingreso_row = cat_upper == "TOTAL INGRESOS"
+        is_egreso_row = cat_upper == "TOTAL EGRESOS"
+        is_subtotal = cat_upper in ("TOTAL OTROS",)
 
         for col_idx, col_name in enumerate(cols, start=1):
             value = row[col_name]
             cell = ws.cell(row=row_idx, column=col_idx, value=value)
             cell.border = border
 
-            if is_total_general:
+            if is_flujo_neto:
                 cell.fill = total_fill
                 cell.font = total_font
+            elif is_ingreso_row:
+                cell.fill = ingreso_fill
+                cell.font = Font(bold=True, size=11)
+            elif is_egreso_row:
+                cell.fill = egreso_fill
+                cell.font = Font(bold=True, size=11)
+            elif is_subtotal:
+                cell.fill = PatternFill("solid", fgColor="D9D9D9")
+                cell.font = Font(bold=True, size=11)
             elif row_idx % 2 == 0:
                 cell.fill = alt_fill
 
@@ -211,11 +252,15 @@ def run():
 
     try:
         archivos = cargar_excels_desde_uploads(uploads)
+        omitidos = [u.name for u in uploads if es_archivo_salida(u.name)]
+        if omitidos:
+            st.info("Archivos omitidos (son reportes generados): {}".format(", ".join(omitidos)))
+
         if not archivos:
-            st.warning("No se encontraron archivos de bancos validos. Los archivos de Consolidado/Flujo/Seguimiento se omiten automaticamente.")
+            st.warning("No se encontraron archivos de bancos validos.")
             return
 
-        st.info("Archivos de banco encontrados: {}".format(len(archivos)))
+        st.info("Archivos de banco a procesar: {}".format(len(archivos)))
 
         all_data = []
         report = []
@@ -223,12 +268,17 @@ def run():
         for nombre, data in archivos:
             try:
                 df, _ = read_real_excel(io.BytesIO(data))
-                clean_df = standardize_df(df, nombre)
+                clean_df, detected = standardize_df(df, nombre)
                 fechas_ok = int(clean_df["Fecha"].notna().sum())
+                categorias_unicas = clean_df["Categoria"].unique().tolist()[:10]
                 report.append({
                     "Archivo": nombre,
                     "Filas": len(clean_df),
+                    "Col Categoria": detected["categoria_col"] or "NO DETECTADA",
+                    "Col Valor": detected["valor_col"] or "NO DETECTADA",
+                    "Col Fecha": detected["fecha_col"] or "NO DETECTADA",
                     "Filas con fecha": fechas_ok,
+                    "Categorias encontradas": str(categorias_unicas),
                     "Estado": "OK",
                 })
                 all_data.append(clean_df)
@@ -236,31 +286,47 @@ def run():
                 report.append({
                     "Archivo": nombre,
                     "Filas": 0,
+                    "Col Categoria": "ERROR",
+                    "Col Valor": "ERROR",
+                    "Col Fecha": "ERROR",
                     "Filas con fecha": 0,
+                    "Categorias encontradas": "",
                     "Estado": "Error: {}".format(str(e)),
                 })
 
-        with st.expander("Reporte de lectura por archivo"):
+        with st.expander("Diagnostico de lectura por archivo", expanded=True):
             st.dataframe(pd.DataFrame(report), use_container_width=True)
+            st.markdown(
+                "Si 'Col Categoria' dice **NO DETECTADA**, el sistema no puede "
+                "separar Ingresos de Egresos. Comparta una captura de las columnas "
+                "de su Excel para corregirlo."
+            )
 
         if not all_data:
             st.error("Ningun archivo aporto datos utiles.")
             return
 
         final_df = pd.concat(all_data, ignore_index=True)
-
         df_con_fecha = final_df[final_df["Fecha"].notna()].copy()
-        df_sin_fecha = final_df[final_df["Fecha"].isna()].copy()
+        n_sin_fecha = int(final_df["Fecha"].isna().sum())
 
-        if len(df_sin_fecha) > 0:
-            st.warning("{} filas no tienen fecha valida y seran ignoradas.".format(len(df_sin_fecha)))
+        if n_sin_fecha > 0:
+            st.warning("{} filas sin fecha valida seran ignoradas.".format(n_sin_fecha))
 
         if df_con_fecha.empty:
             st.error(
-                "No se encontro columna de fecha en los archivos. "
-                "Verifica que los Excel tengan una columna llamada 'Fecha', 'Fecha Movimiento' o similar."
+                "No se encontro columna de fecha en ninguno de los archivos. "
+                "El Flujo de Tesoreria requiere fechas para agrupar por mes."
             )
             return
+
+        cats_unicas = sorted(df_con_fecha["Categoria"].unique().tolist())
+        with st.expander("Categorias unicas encontradas en todos los archivos"):
+            st.write(cats_unicas)
+            st.markdown(
+                "El sistema clasifica como **Ingresos**: ingreso, ingresos, credito, entrada. "
+                "Como **Egresos**: egreso, egresos, gasto, gastos, salida, debito, pago."
+            )
 
         df_con_fecha["Mes_num"] = df_con_fecha["Fecha"].dt.month
         df_con_fecha["Anio"] = df_con_fecha["Fecha"].dt.year
@@ -274,7 +340,7 @@ def run():
             .drop_duplicates()
             .sort_values(["Anio", "Mes_num"])
         )
-        meses_cols = [str(m) for m in meses_presentes["Mes_label"].tolist()]
+        meses_cols = list(meses_presentes["Mes_label"])
 
         grouped = (
             df_con_fecha
@@ -284,7 +350,7 @@ def run():
         )
 
         if grouped.empty:
-            st.error("No hay datos para agrupar. Revisa el reporte de lectura.")
+            st.error("No hay datos para agrupar tras filtrar por fecha.")
             return
 
         pivot_df = grouped.pivot_table(
@@ -296,25 +362,24 @@ def run():
         pivot_df.columns.name = None
 
         existing_mes_cols = [m for m in meses_cols if m in pivot_df.columns]
+        for m in meses_cols:
+            if m not in pivot_df.columns:
+                pivot_df[m] = 0.0
         pivot_df = pivot_df[["Categoria", "Concepto"] + existing_mes_cols]
         pivot_df["Total"] = pivot_df[existing_mes_cols].sum(axis=1)
 
-        mask_ingreso = pivot_df["Categoria"].apply(
-            lambda x: normalize(str(x)) == normalize("Ingreso")
-        )
-        mask_egreso = pivot_df["Categoria"].apply(
-            lambda x: normalize(str(x)) in [
-                normalize("Egreso"),
-                normalize("Egresos"),
-                normalize("Gasto"),
-                normalize("Gastos"),
-                normalize("Salida"),
-            ]
-        )
+        mask_ingreso = pivot_df["Categoria"].apply(es_ingreso)
+        mask_egreso = pivot_df["Categoria"].apply(es_egreso)
 
         ingresos_df = pivot_df[mask_ingreso].copy()
         egresos_df = pivot_df[mask_egreso].copy()
         otros_df = pivot_df[~mask_ingreso & ~mask_egreso].copy()
+
+        st.write(
+            "**Clasificacion:** Ingresos: {} filas | Egresos: {} filas | Otros: {} filas".format(
+                len(ingresos_df), len(egresos_df), len(otros_df)
+            )
+        )
 
         num_cols = existing_mes_cols + ["Total"]
 
@@ -341,9 +406,9 @@ def run():
         if not ingresos_df.empty or not egresos_df.empty:
             flujo_row = {}
             for c in num_cols:
-                ing_val = float(ingresos_df[c].sum()) if not ingresos_df.empty else 0.0
-                egr_val = float(egresos_df[c].sum()) if not egresos_df.empty else 0.0
-                flujo_row[c] = ing_val - egr_val
+                ing = float(ingresos_df[c].sum()) if not ingresos_df.empty else 0.0
+                egr = float(egresos_df[c].sum()) if not egresos_df.empty else 0.0
+                flujo_row[c] = ing - egr
             flujo_row["Categoria"] = "FLUJO NETO"
             flujo_row["Concepto"] = "Ingresos - Egresos"
             sections.append(pd.DataFrame([flujo_row]))
@@ -358,8 +423,8 @@ def run():
 
         if not sections:
             st.error(
-                "No se encontraron categorias de Ingreso ni Egreso. "
-                "Verifica que la columna Categoria tenga esos valores."
+                "No se generaron secciones. Revisa el diagnostico de arriba "
+                "para ver las categorias encontradas."
             )
             return
 
@@ -368,7 +433,7 @@ def run():
         final_pivot = final_pivot[col_order]
 
         st.success(
-            "Flujo de Tesoreria listo: {} mes(es) - {} conceptos".format(
+            "Flujo de Tesoreria listo: {} mes(es) | {} conceptos".format(
                 len(existing_mes_cols), len(pivot_df)
             )
         )
