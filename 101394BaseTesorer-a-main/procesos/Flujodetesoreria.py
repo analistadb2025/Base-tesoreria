@@ -228,7 +228,8 @@ def run():
                 values="Valor",
                 fill_value=0,
             ).reset_index()
-            pivot_df.columns
+            st.success("¡Consolidación exitosa!")
+            st.dataframe(pivot_df)
 
 
 
