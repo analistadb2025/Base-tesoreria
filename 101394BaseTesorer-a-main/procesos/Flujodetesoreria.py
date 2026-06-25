@@ -228,8 +228,82 @@ def run():
                 values="Valor",
                 fill_value=0,
             ).reset_index()
-            st.success("¡Consolidación exitosa!")
-            st.dataframe(pivot_df)
+            pivot_df.columns.name = None
 
+            existing_mes_cols = [m for m in meses_cols if m in pivot_df.columns]
+            pivot_df = pivot_df[["Categoria", "Concepto"] + existing_mes_cols]
+            pivot_df["Total"] = pivot_df[existing_mes_cols].sum(axis=1)
 
+            mask_ingreso = pivot_df["Categoria"].apply(
+                lambda x: normalize(str(x)) == normalize("Ingreso")
+            )
+            mask_egreso = pivot_df["Categoria"].apply(
+                lambda x: normalize(str(x)) in [
+                    normalize("Egreso"), normalize("Egresos"),
+                    normalize("Gasto"), normalize("Gastos"), normalize("Salida")
+                ]
+            )
 
+            ingresos_df = pivot_df[mask_ingreso].copy()
+            egresos_df = pivot_df[mask_egreso].copy()
+            otros_df = pivot_df[~mask_ingreso & ~mask_egreso].copy()
+
+            num_cols = existing_mes_cols + ["Total"]
+
+            def totals_row(df, label_cat, label_conc=""):
+                row = {c: df[c].sum() for c in num_cols}
+                row["Categoria"] = label_cat
+                row["Concepto"] = label_conc
+                return pd.DataFrame([row])
+
+            sections = []
+            if not ingresos_df.empty:
+                sections.append(ingresos_df)
+                sections.append(totals_row(ingresos_df, "TOTAL INGRESOS"))
+            if not egresos_df.empty:
+                sections.append(egresos_df)
+                sections.append(totals_row(egresos_df, "TOTAL EGRESOS"))
+            if not otros_df.empty:
+                sections.append(otros_df)
+                sections.append(totals_row(otros_df, "OTROS", "TOTAL OTROS"))
+
+            if not ingresos_df.empty or not egresos_df.empty:
+                flujo_row = {}
+                for c in num_cols:
+                    ing_val = ingresos_df[c].sum() if not ingresos_df.empty else 0
+                    egr_val = egresos_df[c].sum() if not egresos_df.empty else 0
+                    flujo_row[c] = ing_val - egr_val
+                flujo_row["Categoria"] = "FLUJO NETO"
+                flujo_row["Concepto"] = "Ingresos - Egresos"
+                sections.append(pd.DataFrame([flujo_row]))
+
+                saldo_row = {"Categoria": "SALDO ACUMULADO", "Concepto": "Acumulado del período"}
+                acum = 0
+                for c in existing_mes_cols:
+                    acum += flujo_row[c]
+                    saldo_row[c] = acum
+                saldo_row["Total"] = flujo_row["Total"]
+                sections.append(pd.DataFrame([saldo_row]))
+
+            final_pivot = pd.concat(sections, ignore_index=True)
+            col_order = ["Categoria", "Concepto"] + existing_mes_cols + ["Total"]
+            final_pivot = final_pivot[col_order]
+
+            st.success(f"Flujo de Tesorería listo: {len(existing_mes_cols)} mes(es) — {len(pivot_df)} conceptos")
+
+            df_show = final_pivot.copy()
+            for c in existing_mes_cols + ["Total"]:
+                df_show[c] = df_show[c].apply(
+                    lambda x: f"${x:,.2f}" if isinstance(x, (int, float)) else x
+                )
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+            excel_buf = build_excel_flujo(final_pivot, existing_mes_cols)
+            st.download_button(
+                "⬇️ Descargar Flujo de Tesorería",
+                excel_buf,
+                "Flujo_de_Tesoreria.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        else:
+            st.error("Ningún archivo aportó datos útiles.")
