@@ -228,4 +228,7 @@ def run():
                 values="Valor",
                 fill_value=0,
             ).reset_index()
-            pivot_df.columns,
+            pivot_df.columns
+
+
+
