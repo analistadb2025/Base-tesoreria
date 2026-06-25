@@ -73,42 +73,6 @@ def is_header_row(row):
     return len(short_texts) >= 4
 
 
-def read_real_excel(file):
-    df_raw = pd.read_excel(file, header=None)
-    header_row = None
-    for i, row in df_raw.iterrows():
-        if is_header_row(row):
-            header_row = i
-            break
-    if header_row is None:
-        header_row = 0
-    return pd.read_excel(file, header=header_row), header_row
-
-
-def cargar_excels_desde_uploads(uploads):
-    result = []
-    for upload in uploads:
-        name = upload.name
-        if es_archivo_salida(name):
-            continue
-        data = upload.read()
-        if name.lower().endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(data)) as z:
-                for fname in z.namelist():
-                    if fname.lower().endswith((".xlsx", ".xls")) and not fname.startswith("__"):
-                        fname_base = fname.split("/")[-1]
-                        if not es_archivo_salida(fname_base):
-                            result.append((fname_base, z.read(fname)))
-        elif name.lower().endswith((".xlsx", ".xls")):
-            result.append((name, data))
-    return result
-
-
-def es_recaudo_ventas(concepto_str):
-    norm = normalize(str(concepto_str))
-    return any(normalize(kw) in norm for kw in RECAUDO_KEYWORDS)
-
-
 def standardize_df(df, filename):
     cols = df.columns.tolist()
     n = len(df)
@@ -139,6 +103,62 @@ def standardize_df(df, filename):
         "Fecha": fecha.values,
         "Valor": total.values,
     })
+
+
+# --- NUEVA FUNCIÓN: Extrae TODAS las pestañas (Enero, Febrero, etc.) del Excel ---
+def procesar_todas_las_hojas(file, filename):
+    xls = pd.ExcelFile(file)
+    all_clean = []
+    
+    for sheet_name in xls.sheet_names:
+        try:
+            df_raw = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            if df_raw.empty:
+                continue
+            
+            header_row = None
+            for i, row in df_raw.iterrows():
+                if is_header_row(row):
+                    header_row = i
+                    break
+            if header_row is None:
+                header_row = 0
+                
+            df_sheet = pd.read_excel(xls, sheet_name=sheet_name, header=header_row)
+            
+            # Estandariza la pestaña y la guarda
+            clean_df = standardize_df(df_sheet, filename)
+            all_clean.append(clean_df)
+        except Exception:
+            pass
+    
+    if all_clean:
+        return pd.concat(all_clean, ignore_index=True)
+    return pd.DataFrame()
+
+
+def cargar_excels_desde_uploads(uploads):
+    result = []
+    for upload in uploads:
+        name = upload.name
+        if es_archivo_salida(name):
+            continue
+        data = upload.read()
+        if name.lower().endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for fname in z.namelist():
+                    if fname.lower().endswith((".xlsx", ".xls")) and not fname.startswith("__"):
+                        fname_base = fname.split("/")[-1]
+                        if not es_archivo_salida(fname_base):
+                            result.append((fname_base, z.read(fname)))
+        elif name.lower().endswith((".xlsx", ".xls")):
+            result.append((name, data))
+    return result
+
+
+def es_recaudo_ventas(concepto_str):
+    norm = normalize(str(concepto_str))
+    return any(normalize(kw) in norm for kw in RECAUDO_KEYWORDS)
 
 
 def build_daily_for_month(df_month):
@@ -177,10 +197,8 @@ def write_seguimiento_sheet(ws, df_display):
     total_font = Font(bold=True, size=11)
     alt_fill = PatternFill("solid", fgColor="EBF3FB")
     border = Border(
-        left=Side(style="thin"),
-        right=Side(style="thin"),
-        top=Side(style="thin"),
-        bottom=Side(style="thin"),
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin"),
     )
     money_fmt = "#,##0.00"
     date_fmt = "DD/MM/YYYY"
@@ -275,8 +293,17 @@ def run():
 
         for nombre, data in archivos:
             try:
-                df, _ = read_real_excel(io.BytesIO(data))
-                clean_df = standardize_df(df, nombre)
+                # AQUÍ USAMOS LA NUEVA FUNCIÓN PARA LEER TODAS LAS PESTAÑAS
+                clean_df = procesar_todas_las_hojas(io.BytesIO(data), nombre)
+                
+                if clean_df.empty:
+                    report.append({
+                        "Archivo": nombre,
+                        "Filas totales": 0,
+                        "Filas recaudo": 0,
+                        "Estado": "OK (Vacío o formato no reconocido)",
+                    })
+                    continue
 
                 mask_cat = clean_df["Categoria"].apply(
                     lambda x: normalize(str(x)) == normalize("Ingreso")
@@ -305,8 +332,7 @@ def run():
 
         if not all_data:
             st.warning(
-                "No se encontraron movimientos con categoria Ingreso y concepto Recaudo Ventas. "
-                "Revisa el reporte de lectura para ver que columnas se detectaron."
+                "No se encontraron movimientos con categoria Ingreso y concepto Recaudo Ventas en NINGÚN mes."
             )
             return
 
@@ -354,12 +380,12 @@ def run():
                     df_display = build_daily_for_month(df_mes)
                     df_show = df_display.copy()
                     
-                    # Formatear la fecha
+                    # Formatear la fecha para la web
                     df_show["Fecha"] = df_show["Fecha"].apply(
                         lambda x: x.strftime("%d/%m/%Y") if isinstance(x, pd.Timestamp) else x
                     )
                     
-                    # Formatear a moneda todas las columnas numéricas (Bancos y Totales)
+                    # Formatear a moneda todas las columnas de Bancos y Totales
                     cols_numericas = [c for c in df_show.columns if c != "Fecha"]
                     for col in cols_numericas:
                         df_show[col] = df_show[col].apply(
@@ -370,8 +396,8 @@ def run():
 
         excel_buf = build_excel_seguimiento(data_por_mes)
         st.download_button(
-            "Descargar Seguimiento Recaudo Diario (hoja por mes)",
+            "Descargar Seguimiento Recaudo Diario (Detallado por banco y meses)",
             excel_buf,
-            "Seguimiento_Recaudo_Diario.xlsx",
+            "Seguimiento_Recaudo_Diario_por_Bancos.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
