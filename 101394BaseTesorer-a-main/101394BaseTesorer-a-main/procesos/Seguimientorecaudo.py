@@ -10,11 +10,39 @@ from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+NOMBRES_SALIDA = ["consolidadobancos", "flujotesoreria", "seguimientorecaudo"]
+
+MESES_ES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
+}
+
+COLUMN_MAP = {
+    "categoria": ["categoria"],
+    "concepto": ["concepto"],
+    "valor": ["vlr flujo", "valor dc", "valor d/c", "vlr", "valor", "valor de la compra"],
+    "fecha": ["fecha", "date", "fecha movimiento", "fecha valor", "fecha transaccion"],
+}
+
+RECAUDO_KEYWORDS = [
+    "recaudo ventas",
+    "recaudo de ventas",
+    "recaudo",
+    "ventas",
+    "recaudo venta",
+]
+
 
 def normalize(text):
     text = str(text).lower()
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]", "", text)
+
+
+def es_archivo_salida(nombre):
+    n = normalize(nombre)
+    return any(s in n for s in NOMBRES_SALIDA)
 
 
 def find_column(columns, keywords):
@@ -61,31 +89,19 @@ def cargar_excels_desde_uploads(uploads):
     result = []
     for upload in uploads:
         name = upload.name
+        if es_archivo_salida(name):
+            continue
         data = upload.read()
         if name.lower().endswith(".zip"):
             with zipfile.ZipFile(io.BytesIO(data)) as z:
                 for fname in z.namelist():
                     if fname.lower().endswith((".xlsx", ".xls")) and not fname.startswith("__"):
-                        result.append((fname.split("/")[-1], z.read(fname)))
+                        fname_base = fname.split("/")[-1]
+                        if not es_archivo_salida(fname_base):
+                            result.append((fname_base, z.read(fname)))
         elif name.lower().endswith((".xlsx", ".xls")):
             result.append((name, data))
     return result
-
-
-COLUMN_MAP = {
-    "categoria": ["categoria"],
-    "concepto": ["concepto"],
-    "valor": ["vlr flujo", "valor dc", "valor d/c", "vlr", "valor", "valor de la compra"],
-    "fecha": ["fecha", "date", "fecha movimiento", "fecha valor", "fecha transaccion"],
-}
-
-RECAUDO_KEYWORDS = [
-    "recaudo ventas",
-    "recaudo de ventas",
-    "recaudo",
-    "ventas",
-    "recaudo venta",
-]
 
 
 def es_recaudo_ventas(concepto_str):
@@ -104,7 +120,7 @@ def standardize_df(df, filename):
 
     categoria = df[categoria_col] if categoria_col else pd.Series([None] * n)
     concepto = df[concepto_col] if concepto_col else pd.Series([None] * n)
-    total = clean_money(df[valor_col]) if valor_col else pd.Series([0] * n)
+    total = clean_money(df[valor_col]) if valor_col else pd.Series([0.0] * n)
 
     if fecha_col:
         parsed = pd.to_datetime(df[fecha_col], errors="coerce", dayfirst=True)
@@ -125,11 +141,30 @@ def standardize_df(df, filename):
     })
 
 
-def build_excel_seguimiento(df_display):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Seguimiento Recaudo Diario"
+def build_daily_for_month(df_month):
+    daily = (
+        df_month
+        .groupby("Fecha")["Valor"]
+        .sum()
+        .reset_index()
+        .rename(columns={"Valor": "Total Diario"})
+        .sort_values("Fecha")
+        .reset_index(drop=True)
+    )
+    daily["Concepto"] = "Recaudo Ventas"
+    daily["Total Acumulado"] = daily["Total Diario"].cumsum()
+    daily = daily[["Fecha", "Concepto", "Total Diario", "Total Acumulado"]]
 
+    totals = {
+        "Fecha": "TOTAL",
+        "Concepto": "",
+        "Total Diario": daily["Total Diario"].sum(),
+        "Total Acumulado": daily["Total Acumulado"].iloc[-1],
+    }
+    return pd.concat([daily, pd.DataFrame([totals])], ignore_index=True)
+
+
+def write_seguimiento_sheet(ws, df_display):
     header_fill = PatternFill("solid", fgColor="1F4E79")
     header_font = Font(bold=True, color="FFFFFF", size=11)
     total_fill = PatternFill("solid", fgColor="BDD7EE")
@@ -167,7 +202,7 @@ def build_excel_seguimiento(df_display):
             if col_name == "Fecha" and not is_total and isinstance(value, pd.Timestamp):
                 cell.number_format = date_fmt
                 cell.alignment = Alignment(horizontal="center")
-            elif col_name in ("Valor", "Total Diario", "Total Acumulado") and isinstance(value, (int, float)):
+            elif col_name in ("Total Diario", "Total Acumulado") and isinstance(value, (int, float)):
                 cell.number_format = money_fmt
                 cell.alignment = Alignment(horizontal="right")
 
@@ -179,6 +214,24 @@ def build_excel_seguimiento(df_display):
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 45)
 
     ws.freeze_panes = "A2"
+
+
+def build_excel_seguimiento(data_por_mes):
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    all_daily = []
+    for mes_label, df_mes in data_por_mes.items():
+        df_display = build_daily_for_month(df_mes)
+        ws = wb.create_sheet(title=mes_label[:31])
+        write_seguimiento_sheet(ws, df_display)
+        all_daily.append(df_mes)
+
+    df_todo = pd.concat(all_daily, ignore_index=True)
+    df_total_display = build_daily_for_month(df_todo)
+    ws_total = wb.create_sheet(title="Total")
+    write_seguimiento_sheet(ws_total, df_total_display)
+
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -188,9 +241,9 @@ def build_excel_seguimiento(df_display):
 def run():
     st.title("Seguimiento Recaudo Diario")
     st.markdown(
-        "Sube los archivos Excel de los bancos **o un ZIP** que los contenga. "
-        "El sistema filtra categoria = Ingreso y concepto = Recaudo Ventas, "
-        "agrupa por fecha y calcula el total diario."
+        "Sube los archivos Excel de los bancos **o un ZIP**. "
+        "Filtra categoria = Ingreso y concepto = Recaudo Ventas. "
+        "El Excel resultante tendra una hoja por mes + hoja Total."
     )
 
     uploads = st.file_uploader(
@@ -202,7 +255,11 @@ def run():
 
     if uploads:
         archivos = cargar_excels_desde_uploads(uploads)
-        st.info("Archivos encontrados: {}".format(len(archivos)))
+        if not archivos:
+            st.warning("No se encontraron archivos de bancos validos.")
+            return
+
+        st.info("Archivos de banco encontrados: {}".format(len(archivos)))
 
         all_data = []
         report = []
@@ -237,61 +294,71 @@ def run():
         with st.expander("Reporte de lectura por archivo"):
             st.dataframe(pd.DataFrame(report), use_container_width=True)
 
-        if all_data:
-            final_df = pd.concat(all_data, ignore_index=True)
-            final_df = final_df.dropna(subset=["Fecha"])
-
-            if final_df.empty:
-                st.warning("No se encontraron movimientos de recaudo ventas con fechas validas.")
-            else:
-                daily = (
-                    final_df
-                    .groupby("Fecha")["Valor"]
-                    .sum()
-                    .reset_index()
-                    .rename(columns={"Valor": "Total Diario"})
-                    .sort_values("Fecha")
-                    .reset_index(drop=True)
-                )
-                daily["Concepto"] = "Recaudo Ventas"
-                daily["Total Acumulado"] = daily["Total Diario"].cumsum()
-                daily = daily[["Fecha", "Concepto", "Total Diario", "Total Acumulado"]]
-
-                totals = {
-                    "Fecha": "TOTAL",
-                    "Concepto": "",
-                    "Total Diario": daily["Total Diario"].sum(),
-                    "Total Acumulado": daily["Total Acumulado"].iloc[-1],
-                }
-                df_display = pd.concat([daily, pd.DataFrame([totals])], ignore_index=True)
-
-                st.success(
-                    "Seguimiento listo: {} dias con recaudo - Total: ${:,.0f}".format(
-                        len(daily), daily["Total Diario"].sum()
-                    )
-                )
-
-                df_show = df_display.copy()
-                df_show["Fecha"] = df_show["Fecha"].apply(
-                    lambda x: x.strftime("%d/%m/%Y") if isinstance(x, pd.Timestamp) else x
-                )
-                df_show["Total Diario"] = df_show["Total Diario"].apply(
-                    lambda x: "${:,.2f}".format(x) if isinstance(x, float) else x
-                )
-                df_show["Total Acumulado"] = df_show["Total Acumulado"].apply(
-                    lambda x: "${:,.2f}".format(x) if isinstance(x, float) else x
-                )
-                st.dataframe(df_show, use_container_width=True, hide_index=True)
-
-                excel_buf = build_excel_seguimiento(df_display)
-                st.download_button(
-                    "Descargar Seguimiento Recaudo Diario",
-                    excel_buf,
-                    "Seguimiento_Recaudo_Diario.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-        else:
+        if not all_data:
             st.warning(
-                "No se encontraron movimientos con categoria Ingreso y concepto Recaudo Ventas "
-                "en ningun archivo. Verifica que los Excel tengan esas columnas y valores."
+                "No se encontraron movimientos con categoria Ingreso y concepto Recaudo Ventas. "
+                "Revisa el reporte de lectura para ver que columnas se detectaron."
             )
+            return
+
+        final_df = pd.concat(all_data, ignore_index=True)
+        final_df = final_df.dropna(subset=["Fecha"])
+
+        if final_df.empty:
+            st.warning("No hay registros de recaudo con fechas validas.")
+            return
+
+        final_df = final_df.copy()
+        final_df["Mes_num"] = final_df["Fecha"].dt.month
+        final_df["Anio"] = final_df["Fecha"].dt.year
+        final_df["Mes"] = final_df["Mes_num"].map(MESES_ES)
+        final_df["Mes_label"] = final_df.apply(
+            lambda r: "{} {}".format(r["Mes"], int(r["Anio"])), axis=1
+        )
+
+        orden = (
+            final_df[["Anio", "Mes_num", "Mes_label"]]
+            .drop_duplicates()
+            .sort_values(["Anio", "Mes_num"])
+        )
+        meses_ordenados = orden["Mes_label"].tolist()
+
+        data_por_mes = {}
+        for mes in meses_ordenados:
+            df_mes = final_df[final_df["Mes_label"] == mes]
+            if not df_mes.empty:
+                data_por_mes[mes] = df_mes
+
+        total_recaudo = final_df["Valor"].sum()
+        st.success(
+            "Seguimiento listo: {} mes(es), {} dias con recaudo - Total: ${:,.0f}".format(
+                len(data_por_mes),
+                final_df["Fecha"].nunique(),
+                total_recaudo,
+            )
+        )
+
+        if len(data_por_mes) <= 12:
+            tabs = st.tabs(list(data_por_mes.keys()))
+            for tab, (mes_label, df_mes) in zip(tabs, data_por_mes.items()):
+                with tab:
+                    df_display = build_daily_for_month(df_mes)
+                    df_show = df_display.copy()
+                    df_show["Fecha"] = df_show["Fecha"].apply(
+                        lambda x: x.strftime("%d/%m/%Y") if isinstance(x, pd.Timestamp) else x
+                    )
+                    df_show["Total Diario"] = df_show["Total Diario"].apply(
+                        lambda x: "${:,.2f}".format(x) if isinstance(x, float) else x
+                    )
+                    df_show["Total Acumulado"] = df_show["Total Acumulado"].apply(
+                        lambda x: "${:,.2f}".format(x) if isinstance(x, float) else x
+                    )
+                    st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+        excel_buf = build_excel_seguimiento(data_por_mes)
+        st.download_button(
+            "Descargar Seguimiento Recaudo Diario (hoja por mes)",
+            excel_buf,
+            "Seguimiento_Recaudo_Diario.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
