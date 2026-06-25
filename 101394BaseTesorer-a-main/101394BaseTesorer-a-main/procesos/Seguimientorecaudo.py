@@ -142,25 +142,31 @@ def standardize_df(df, filename):
 
 
 def build_daily_for_month(df_month):
-    daily = (
-        df_month
-        .groupby("Fecha")["Valor"]
-        .sum()
-        .reset_index()
-        .rename(columns={"Valor": "Total Diario"})
-        .sort_values("Fecha")
-        .reset_index(drop=True)
-    )
-    daily["Concepto"] = "Recaudo Ventas"
-    daily["Total Acumulado"] = daily["Total Diario"].cumsum()
-    daily = daily[["Fecha", "Concepto", "Total Diario", "Total Acumulado"]]
+    # Crear tabla dinámica: filas = Fecha, columnas = Banco, valores = Valor
+    daily = df_month.pivot_table(
+        index="Fecha",
+        columns="Banco",
+        values="Valor",
+        aggfunc="sum",
+        fill_value=0
+    ).reset_index()
 
-    totals = {
-        "Fecha": "TOTAL",
-        "Concepto": "",
-        "Total Diario": daily["Total Diario"].sum(),
-        "Total Acumulado": daily["Total Acumulado"].iloc[-1],
-    }
+    daily = daily.sort_values("Fecha").reset_index(drop=True)
+
+    # Identificar las columnas de los bancos (todas las que no sean 'Fecha')
+    bancos_cols = [c for c in daily.columns if c != "Fecha"]
+
+    # Calcular Totales diarios y acumulados
+    daily["Total Diario"] = daily[bancos_cols].sum(axis=1)
+    daily["Total Acumulado"] = daily["Total Diario"].cumsum()
+
+    # Construir la fila de Totales al final
+    totals = {"Fecha": "TOTAL"}
+    for banco in bancos_cols:
+        totals[banco] = daily[banco].sum()
+    totals["Total Diario"] = daily["Total Diario"].sum()
+    totals["Total Acumulado"] = daily["Total Acumulado"].iloc[-1] if not daily.empty else 0
+
     return pd.concat([daily, pd.DataFrame([totals])], ignore_index=True)
 
 
@@ -198,11 +204,14 @@ def write_seguimiento_sheet(ws, df_display):
                 cell.font = total_font
             elif use_alt:
                 cell.fill = alt_fill
+            
             col_name = cols[col_idx - 1]
+            
             if col_name == "Fecha" and not is_total and isinstance(value, pd.Timestamp):
                 cell.number_format = date_fmt
                 cell.alignment = Alignment(horizontal="center")
-            elif col_name in ("Total Diario", "Total Acumulado") and isinstance(value, (int, float)):
+            # Aplicar formato de moneda a CUALQUIER columna que no sea Fecha
+            elif col_name != "Fecha" and isinstance(value, (int, float)):
                 cell.number_format = money_fmt
                 cell.alignment = Alignment(horizontal="right")
 
@@ -243,7 +252,7 @@ def run():
     st.markdown(
         "Sube los archivos Excel de los bancos **o un ZIP**. "
         "Filtra categoria = Ingreso y concepto = Recaudo Ventas. "
-        "El Excel resultante tendra una hoja por mes + hoja Total."
+        "El Excel resultante tendra una hoja por mes + hoja Total con detalle por banco."
     )
 
     uploads = st.file_uploader(
@@ -344,15 +353,19 @@ def run():
                 with tab:
                     df_display = build_daily_for_month(df_mes)
                     df_show = df_display.copy()
+                    
+                    # Formatear la fecha
                     df_show["Fecha"] = df_show["Fecha"].apply(
                         lambda x: x.strftime("%d/%m/%Y") if isinstance(x, pd.Timestamp) else x
                     )
-                    df_show["Total Diario"] = df_show["Total Diario"].apply(
-                        lambda x: "${:,.2f}".format(x) if isinstance(x, float) else x
-                    )
-                    df_show["Total Acumulado"] = df_show["Total Acumulado"].apply(
-                        lambda x: "${:,.2f}".format(x) if isinstance(x, float) else x
-                    )
+                    
+                    # Formatear a moneda todas las columnas numéricas (Bancos y Totales)
+                    cols_numericas = [c for c in df_show.columns if c != "Fecha"]
+                    for col in cols_numericas:
+                        df_show[col] = df_show[col].apply(
+                            lambda x: "${:,.2f}".format(x) if isinstance(x, (int, float)) else x
+                        )
+                        
                     st.dataframe(df_show, use_container_width=True, hide_index=True)
 
         excel_buf = build_excel_seguimiento(data_por_mes)
