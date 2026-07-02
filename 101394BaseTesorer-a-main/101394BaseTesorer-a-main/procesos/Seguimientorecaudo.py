@@ -18,13 +18,25 @@ MESES_ES = {
     9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
 }
 
-# KEYWORDS AMPLIADAS para capturar variaciones en los diferentes meses
-KEYWORDS_CATEGORIA = ["categoria", "tipo", "tipo de movimiento", "tipo movimiento", "clase"]
-KEYWORDS_CONCEPTO  = ["concepto", "descripcion", "description", "detalle", "referencia", "movimiento"]
-KEYWORDS_VALOR     = ["vlr flujo", "valor dc", "valor d/c", "vlr", "valor", "importe", "monto", "cantidad", "valores"]
-KEYWORDS_FECHA     = ["fecha", "date", "fecha movimiento", "fecha valor", "fecha transaccion", "fec", "fec.", "fechas", "fecha_mov", "fecha operacion"]
+# Tokens de meses para detectar hojas (en minúsculas normalizadas, sin tildes)
+HOJAS_MESES = {
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+}
 
-RECAUDO_KEYWORDS = ["recaudo", "ventas", "recaudo ventas", "recaudo de ventas"]
+# Palabras clave que se esperan en la fila de encabezado del banco
+HEADER_KEYWORDS = {
+    "cuenta", "fecha", "valor", "debito", "credito", "saldo",
+    "descripcion", "concepto", "banco", "sucursal", "tipo", "monto",
+    "importe", "transaccion", "movimiento", "referencia", "categ",
+}
+
+KEYWORDS_CATEGORIA = ["categoria", "tipo", "tipo de movimiento", "tipo movimiento", "clase", "categ"]
+KEYWORDS_CONCEPTO  = ["concepto", "descripcion", "description", "detalle", "referencia", "movimiento"]
+KEYWORDS_VALOR     = ["vlr flujo", "valor dc", "valor d/c", "vlr", "valor", "importe", "monto", "credito", "creditos"]
+KEYWORDS_FECHA     = ["fecha", "date", "fecha movimiento", "fecha valor", "fecha transaccion", "fec"]
+
+RECAUDO_KEYWORDS = ["recaudo", "ventas", "recaudo ventas", "recaudo de ventas", "consignacion", "consignaciones"]
 
 
 def normalize(text):
@@ -38,6 +50,15 @@ def es_archivo_salida(nombre):
     return any(s in n for s in NOMBRES_SALIDA)
 
 
+def es_hoja_mes(nombre_hoja):
+    """
+    Retorna True si el nombre de la hoja contiene el nombre de un mes.
+    Tolerante a variantes como 'Enero 2024', 'ENERO-1', 'Mes Enero'.
+    """
+    nombre_norm = normalize(str(nombre_hoja))
+    return any(mes in nombre_norm for mes in HOJAS_MESES)
+
+
 def find_column(columns, keywords):
     normalized_cols = {normalize(col): col for col in columns}
     for key in keywords:
@@ -48,66 +69,111 @@ def find_column(columns, keywords):
     return None
 
 
+def parse_amount(val):
+    """
+    Parsea montos en formato colombiano/europeo (punto=miles, coma=decimal)
+    y en formato americano (coma=miles, punto=decimal).
+    Ejemplos:
+      '232.000'     → 232000.0   (COP: punto como miles)
+      '232.000,50'  → 232000.5   (COP: punto miles, coma decimal)
+      '1,234.56'    → 1234.56    (USD: coma miles, punto decimal)
+      '232000'      → 232000.0
+    """
+    s = str(val).strip().replace("$", "").replace(" ", "")
+    if not s or s in ("nan", "None", "-", ""):
+        return 0.0
+    has_dot   = "." in s
+    has_comma = "," in s
+    try:
+        if has_dot and has_comma:
+            last_dot   = s.rfind(".")
+            last_comma = s.rfind(",")
+            if last_dot > last_comma:
+                # Formato americano: 1,234.56 → punto es decimal
+                s = s.replace(",", "")
+            else:
+                # Formato COP/europeo: 1.234,56 → coma es decimal
+                s = s.replace(".", "").replace(",", ".")
+        elif has_dot:
+            # Solo puntos: si todos los grupos tras el punto tienen 3 dígitos → miles
+            parts = s.split(".")
+            if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
+                s = s.replace(".", "")
+            # else el punto es decimal, dejar como está
+        elif has_comma:
+            # Solo comas
+            parts = s.split(",")
+            if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
+                s = s.replace(",", "")
+            else:
+                # Coma como decimal
+                s = s.replace(",", ".")
+        return float(s)
+    except Exception:
+        return 0.0
+
+
 def clean_money(series):
-    return (
-        series.astype(str)
-        .str.replace("$", "", regex=False)
-        .str.replace(",", "", regex=False)
-        .str.replace(" ", "", regex=False)
-        .str.strip()
-        .pipe(pd.to_numeric, errors="coerce")
-        .fillna(0.0)
-    )
+    return series.apply(parse_amount)
 
 
 def is_header_row(row):
-    text_cells = [str(x).strip() for x in row if isinstance(x, str) and len(str(x).strip()) > 0]
-    return len([t for t in text_cells if len(t) < 30]) >= 4
+    """
+    Detecta la fila de encabezado buscando al menos 3 palabras clave
+    típicas de los extractos bancarios (fecha, valor, cuenta, etc.).
+    """
+    normalized_cells = [normalize(str(x)) for x in row if str(x).strip() not in ("", "nan")]
+    matches = sum(
+        1 for cell in normalized_cells
+        if any(kw in cell for kw in HEADER_KEYWORDS)
+    )
+    return matches >= 3
 
 
 def read_real_excel(file):
-    """Lee TODAS las hojas del Excel, identifica sus cabeceras tolerando fallos y las concatena."""
+    """
+    Lee SOLO las hojas de meses (ENERO, FEBRERO, MARZO, etc.) del Excel
+    y las concatena en un solo DataFrame.
+    Las hojas de reconciliación (Rec.Ene, Rec.Feb, etc.) se omiten.
+    """
     try:
         xl = pd.ExcelFile(file)
-    except Exception as e:
-        st.error(f"No se pudo abrir el archivo Excel: {e}")
-        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame(), []
 
     all_dfs = []
+    hojas_leidas = []
+
     for sheet_name in xl.sheet_names:
+        # *** FIX PRINCIPAL: solo procesar hojas de meses ***
+        if not es_hoja_mes(sheet_name):
+            continue
+
         try:
             df_raw = xl.parse(sheet_name, header=None)
             if df_raw.empty or len(df_raw) < 2:
                 continue
-                
-            header_row = None
+
+            # Buscar la fila de encabezado real
+            header_row = 0
             for i, row in df_raw.iterrows():
                 if is_header_row(row):
                     header_row = i
                     break
-            
-            # Si no detecta una cabecera perfecta, intentamos forzar la fila 0
-            if header_row is None:
-                header_row = 0 
-            
+
             df = xl.parse(sheet_name, header=header_row)
-            
-            # Limpiamos filas y columnas completamente vacías
             df = df.dropna(how="all")
-            df = df.loc[:, ~df.columns.str.contains('^Unnamed', na=True) | df.notna().any()]
-            
+
             if not df.empty:
-                df["Pestana_Origen"] = sheet_name # Útil para depurar si algo falla
                 all_dfs.append(df)
-                
-        except Exception as sheet_error:
-            st.warning(f"No se pudo procesar la hoja '{sheet_name}': {sheet_error}")
+                hojas_leidas.append(sheet_name)
+        except Exception:
             continue
 
     if not all_dfs:
-        return pd.DataFrame()
-        
-    return pd.concat(all_dfs, ignore_index=True, sort=False)
+        return pd.DataFrame(), hojas_leidas
+
+    return pd.concat(all_dfs, ignore_index=True, sort=False), hojas_leidas
 
 
 def cargar_excels(uploads):
@@ -291,10 +357,16 @@ def build_excel(data_por_mes, banco_cols):
 
 
 def run():
-    st.title("Seguimiento Recaudo Diario")
+    st.set_page_config(
+        page_title="Seguimiento Recaudo Diario",
+        page_icon="🏦",
+        layout="wide",
+    )
+    st.title("🏦 Seguimiento Recaudo Diario")
     st.markdown(
         "Sube los archivos Excel de los bancos o un ZIP. "
-        "El Excel genera **una hoja por mes** con filas = fechas y columnas = banco."
+        "El sistema lee las hojas de cada mes (**ENERO, FEBRERO, MARZO…**) "
+        "y genera una hoja por mes con filas = fechas y columnas = banco."
     )
 
     uploads = st.file_uploader(
@@ -310,17 +382,28 @@ def run():
     try:
         archivos = cargar_excels(uploads)
         if not archivos:
-            st.warning("No se encontraron archivos de banco validos.")
+            st.warning("No se encontraron archivos de banco válidos.")
             return
 
-        st.info("Archivos a procesar: {}".format(len(archivos)))
+        st.info("📂 Archivos a procesar: **{}**".format(len(archivos)))
 
         all_data = []
         report   = []
 
         for nombre, data in archivos:
             try:
-                df       = read_real_excel(io.BytesIO(data))
+                df, hojas_leidas = read_real_excel(io.BytesIO(data))
+
+                if df.empty:
+                    report.append({
+                        "Archivo": nombre,
+                        "Hojas leídas": "Ninguna",
+                        "Total filas": 0,
+                        "Filas recaudo": 0,
+                        "Estado": "Sin hojas de mes",
+                    })
+                    continue
+
                 clean_df = standardize_df(df, nombre)
 
                 mask_cat = clean_df["Categoria"].apply(
@@ -329,27 +412,36 @@ def run():
                 mask_con = clean_df["Concepto"].apply(es_recaudo)
                 filtered = clean_df[mask_cat & mask_con].copy()
 
+                # Si no hay match con categoría+concepto, buscar solo por concepto
                 if filtered.empty:
                     filtered = clean_df[mask_con].copy()
 
+                estado = "OK" if not filtered.empty else "Sin filas de recaudo"
                 report.append({
                     "Archivo": nombre,
+                    "Hojas leídas": ", ".join(hojas_leidas),
                     "Total filas": len(clean_df),
                     "Filas recaudo": len(filtered),
-                    "Estado": "OK",
+                    "Estado": estado,
                 })
                 if not filtered.empty:
                     all_data.append(filtered)
             except Exception as e:
-                report.append({"Archivo": nombre, "Total filas": 0, "Filas recaudo": 0, "Estado": str(e)})
+                report.append({
+                    "Archivo": nombre,
+                    "Hojas leídas": "",
+                    "Total filas": 0,
+                    "Filas recaudo": 0,
+                    "Estado": str(e),
+                })
 
-        with st.expander("Reporte de lectura"):
+        with st.expander("📋 Reporte de lectura por archivo"):
             st.dataframe(pd.DataFrame(report), use_container_width=True)
 
         if not all_data:
             st.warning(
-                "No se encontraron filas de recaudo. "
-                "Verifica que los archivos tengan columnas de Categoria y Concepto."
+                "⚠️ No se encontraron filas de recaudo. "
+                "Verifica que los archivos tengan hojas llamadas ENERO, FEBRERO, MARZO, etc."
             )
             return
 
@@ -357,7 +449,7 @@ def run():
         final_df = final_df[final_df["Fecha"].notna()].copy()
 
         if final_df.empty:
-            st.warning("No hay registros con fecha valida.")
+            st.warning("No hay registros con fecha válida.")
             return
 
         final_df["Mes_num"]   = final_df["Fecha"].dt.month
@@ -381,27 +473,36 @@ def run():
             if not df_mes.empty:
                 data_por_mes[mes] = df_mes
 
-        st.success(
-            "{} mes(es) | {} banco(s) | Total recaudo: ${:,.0f}".format(
-                len(data_por_mes), len(banco_cols), final_df["Valor"].sum()
-            )
-        )
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Meses encontrados", len(data_por_mes))
+        col2.metric("Bancos", len(banco_cols))
+        col3.metric("Total recaudo", "${:,.0f}".format(final_df["Valor"].sum()))
 
-        tabs = st.tabs(list(data_por_mes.keys()) + ["Total"])
+        st.markdown("---")
+
+        # Pestañas: una por mes + Total
+        tab_labels = list(data_por_mes.keys()) + ["📊 Total"]
+        tabs = st.tabs(tab_labels)
         dfs_preview = list(data_por_mes.items()) + [("Total", final_df)]
+
         for tab, (mes_label, df_mes) in zip(tabs, dfs_preview):
             with tab:
                 pivot = build_pivot_mes(df_mes, banco_cols)
                 st.dataframe(pivot, use_container_width=True, hide_index=True)
 
+        st.markdown("---")
         excel_buf = build_excel(data_por_mes, banco_cols)
         st.download_button(
-            "Descargar Seguimiento Recaudo Diario",
-            excel_buf,
-            "Seguimiento_Recaudo_Diario.xlsx",
+            label="⬇️ Descargar Seguimiento Recaudo Diario (.xlsx)",
+            data=excel_buf,
+            file_name="Seguimiento_Recaudo_Diario.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     except Exception as e:
         st.error("Error: {}".format(str(e)))
         st.exception(e)
+
+
+if __name__ == "__main__":
+    run()
