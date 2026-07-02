@@ -18,10 +18,11 @@ MESES_ES = {
     9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
 }
 
+# KEYWORDS AMPLIADAS para capturar variaciones en los diferentes meses
 KEYWORDS_CATEGORIA = ["categoria", "tipo", "tipo de movimiento", "tipo movimiento", "clase"]
 KEYWORDS_CONCEPTO  = ["concepto", "descripcion", "description", "detalle", "referencia", "movimiento"]
-KEYWORDS_VALOR     = ["vlr flujo", "valor dc", "valor d/c", "vlr", "valor", "importe", "monto"]
-KEYWORDS_FECHA     = ["fecha", "date", "fecha movimiento", "fecha valor", "fecha transaccion", "fec"]
+KEYWORDS_VALOR     = ["vlr flujo", "valor dc", "valor d/c", "vlr", "valor", "importe", "monto", "cantidad", "valores"]
+KEYWORDS_FECHA     = ["fecha", "date", "fecha movimiento", "fecha valor", "fecha transaccion", "fec", "fec.", "fechas", "fecha_mov", "fecha operacion"]
 
 RECAUDO_KEYWORDS = ["recaudo", "ventas", "recaudo ventas", "recaudo de ventas"]
 
@@ -65,10 +66,11 @@ def is_header_row(row):
 
 
 def read_real_excel(file):
-    """Lee TODAS las hojas del Excel y las concatena en un solo DataFrame."""
+    """Lee TODAS las hojas del Excel, identifica sus cabeceras tolerando fallos y las concatena."""
     try:
         xl = pd.ExcelFile(file)
-    except Exception:
+    except Exception as e:
+        st.error(f"No se pudo abrir el archivo Excel: {e}")
         return pd.DataFrame()
 
     all_dfs = []
@@ -77,20 +79,34 @@ def read_real_excel(file):
             df_raw = xl.parse(sheet_name, header=None)
             if df_raw.empty or len(df_raw) < 2:
                 continue
-            header_row = 0
+                
+            header_row = None
             for i, row in df_raw.iterrows():
                 if is_header_row(row):
                     header_row = i
                     break
+            
+            # Si no detecta una cabecera perfecta, intentamos forzar la fila 0
+            if header_row is None:
+                header_row = 0 
+            
             df = xl.parse(sheet_name, header=header_row)
+            
+            # Limpiamos filas y columnas completamente vacías
             df = df.dropna(how="all")
+            df = df.loc[:, ~df.columns.str.contains('^Unnamed', na=True) | df.notna().any()]
+            
             if not df.empty:
+                df["Pestana_Origen"] = sheet_name # Útil para depurar si algo falla
                 all_dfs.append(df)
-        except Exception:
+                
+        except Exception as sheet_error:
+            st.warning(f"No se pudo procesar la hoja '{sheet_name}': {sheet_error}")
             continue
 
     if not all_dfs:
         return pd.DataFrame()
+        
     return pd.concat(all_dfs, ignore_index=True, sort=False)
 
 
