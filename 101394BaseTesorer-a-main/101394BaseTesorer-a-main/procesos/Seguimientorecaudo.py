@@ -65,13 +65,33 @@ def is_header_row(row):
 
 
 def read_real_excel(file):
-    df_raw = pd.read_excel(file, header=None)
-    header_row = 0
-    for i, row in df_raw.iterrows():
-        if is_header_row(row):
-            header_row = i
-            break
-    return pd.read_excel(file, header=header_row)
+    """Lee TODAS las hojas del Excel y las concatena en un solo DataFrame."""
+    try:
+        xl = pd.ExcelFile(file)
+    except Exception:
+        return pd.DataFrame()
+
+    all_dfs = []
+    for sheet_name in xl.sheet_names:
+        try:
+            df_raw = xl.parse(sheet_name, header=None)
+            if df_raw.empty or len(df_raw) < 2:
+                continue
+            header_row = 0
+            for i, row in df_raw.iterrows():
+                if is_header_row(row):
+                    header_row = i
+                    break
+            df = xl.parse(sheet_name, header=header_row)
+            df = df.dropna(how="all")
+            if not df.empty:
+                all_dfs.append(df)
+        except Exception:
+            continue
+
+    if not all_dfs:
+        return pd.DataFrame()
+    return pd.concat(all_dfs, ignore_index=True, sort=False)
 
 
 def cargar_excels(uploads):
@@ -128,6 +148,12 @@ def es_recaudo(concepto_str):
     return any(normalize(kw) in norm for kw in RECAUDO_KEYWORDS)
 
 
+HEADER_COLOR   = "1F4E79"
+WEEKEND_BG     = "FCE4D6"
+ALT_BG         = "EBF3FB"
+GRAND_TOTAL_BG = "163755"
+
+
 def safe_val(v):
     if isinstance(v, pd.Timestamp):
         return v.to_pydatetime()
@@ -136,18 +162,12 @@ def safe_val(v):
     return v
 
 
-HEADER_COLOR   = "1F4E79"
-GRAND_TOTAL_BG = "163755"
-WEEKEND_BG     = "FCE4D6"
-ALT_BG         = "EBF3FB"
-
-
 def write_daily_sheet(ws, pivot, banco_cols):
-    all_cols  = ["Fecha"] + banco_cols + ["Total Diario", "Total Acumulado Mes"]
+    all_cols   = ["Fecha"] + banco_cols + ["Total Diario", "Total Acumulado Mes"]
     money_cols = banco_cols + ["Total Diario", "Total Acumulado Mes"]
 
-    thin   = Side(style="thin")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    thin        = Side(style="thin")
+    border      = Border(left=thin, right=thin, top=thin, bottom=thin)
     header_fill = PatternFill("solid", fgColor=HEADER_COLOR)
     alt_fill    = PatternFill("solid", fgColor=ALT_BG)
     wknd_fill   = PatternFill("solid", fgColor=WEEKEND_BG)
@@ -163,21 +183,16 @@ def write_daily_sheet(ws, pivot, banco_cols):
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     for ri, (_, row) in enumerate(pivot.iterrows(), start=2):
-        fecha_val = row["Fecha"]
-        is_weekend = False
-        if isinstance(fecha_val, pd.Timestamp):
-            is_weekend = fecha_val.weekday() >= 5
-
-        row_fill = wknd_fill if is_weekend else (alt_fill if ri % 2 == 0 else None)
+        fecha_val  = row["Fecha"]
+        is_weekend = isinstance(fecha_val, pd.Timestamp) and fecha_val.weekday() >= 5
+        row_fill   = wknd_fill if is_weekend else (alt_fill if ri % 2 == 0 else None)
 
         for ci, col_name in enumerate(all_cols, start=1):
-            raw  = row[col_name]
-            v    = safe_val(raw)
+            v    = safe_val(row[col_name])
             cell = ws.cell(row=ri, column=ci, value=v)
             cell.border = border
             if row_fill:
                 cell.fill = row_fill
-
             if col_name == "Fecha":
                 if hasattr(v, "strftime"):
                     cell.number_format = "DD/MM/YYYY"
